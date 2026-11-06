@@ -68,6 +68,29 @@ std::atomic<int> MemFabricTransport::g_init_ref_{0};
 std::mutex MemFabricTransport::g_init_mutex_;
 
 MemFabricSubBatch::~MemFabricSubBatch() {
+    if (TransferTrace::Enabled()) {
+        LOG(INFO) << "[MF_TRACE] pid=" << getpid()
+                  << " stage=memfabric_batch tent_batch_id="
+                  << progress_batch_id
+                  << " transport_submit_calls=" << trace.submit_calls
+                  << " requests=" << trace.requests
+                  << " native_slices=" << trace.native_slices
+                  << " bytes=" << trace.bytes
+                  << " smem_batch_copy_calls=" << trace.copy_calls
+                  << " copy_errors=" << trace.copy_errors
+                  << " transport_status_calls=" << trace.status_calls
+                  << " smem_status_query_calls=" << trace.query_calls
+                  << " pending_queries=" << trace.pending_queries
+                  << " query_errors=" << trace.query_errors
+                  << " failed_native_batches=" << trace.failed_native_batches
+                  << " submit_lock_wait_us=" << trace.submit_lock_wait_us
+                  << " resolve_dest_us=" << trace.resolve_dest_us
+                  << " prepare_us=" << trace.prepare_us
+                  << " copy_api_us=" << trace.copy_api_us
+                  << " query_api_us=" << trace.query_api_us
+                  << " observed_completion_us=" << trace.observed_completion_us
+                  << " pending_native_batches=" << pending_batch_count;
+    }
     if (pending_batch_count > 0)
         LOG(WARNING) << "~MemFabricSubBatch: " << pending_batch_count
                      << " batch(es) still PENDING out of " << task_list.size()
@@ -372,7 +395,9 @@ Status MemFabricTransport::freeSubBatch(SubBatchRef& batch) {
 
 Status MemFabricTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
+    const auto lock_start = TransferTrace::Now();
     std::lock_guard<std::mutex> lock(inflight_mu_);
+    const auto prepare_start = TransferTrace::Now();
     if (stopping_)
         return Status::InternalError(
             "MemFabric transport is stopping" LOC_MARK);
@@ -382,6 +407,19 @@ Status MemFabricTransport::submitTransferTasks(
         return Status::InvalidArgument("invalid sub-batch" LOC_MARK);
     }
 
+    const bool tracing = TransferTrace::Enabled();
+    if (tracing) {
+        if (mf_batch->trace.submit_calls == 0)
+            mf_batch->trace.first_submit = lock_start;
+        ++mf_batch->trace.submit_calls;
+        mf_batch->trace.requests += request_list.size();
+        mf_batch->trace.submit_lock_wait_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                prepare_start - lock_start)
+                .count();
+        mf_batch->trace.observed_completion_us = -1;
+    }
+    int64_t copy_api_us = 0;
     if (!handle_)
         return Status::InternalError(
             "Register memory before transfer" LOC_MARK);
@@ -423,9 +461,13 @@ Status MemFabricTransport::submitTransferTasks(
     // Resolve every destination before changing the sub-batch so an error
     // leaves existing tasks untouched and dispatches no new work.
     std::vector<std::string> dest_urls(request_list.size());
+    const auto resolve_start = TransferTrace::Now();
     for (size_t i = 0; i < request_list.size(); ++i) {
         CHECK_STATUS(resolveDestUrl(request_list[i], dest_urls[i]));
     }
+    if (tracing)
+        mf_batch->trace.resolve_dest_us +=
+            TransferTrace::ElapsedUs(resolve_start);
 
     using GroupKey = std::pair<std::string, bool>;  // {dest_url, is_write}
     std::map<GroupKey, std::vector<size_t>> groups;
@@ -483,8 +525,29 @@ Status MemFabricTransport::submitTransferTasks(
         params.flags = 0;
 
         uint64_t batch_id = 0;
+        const auto copy_start = TransferTrace::Now();
         auto ret =
             MemFabricUnderApi::SmemTransBatchCopy(handle_, &params, &batch_id);
+        if (tracing) {
+            const auto api_us = TransferTrace::ElapsedUs(copy_start);
+            copy_api_us += api_us;
+            auto& stats = mf_batch->trace;
+            ++stats.copy_calls;
+            stats.copy_errors += ret != SM_OK;
+            stats.native_slices += batch_size;
+            uint64_t bytes = 0;
+            for (const auto size : size_list) bytes += size;
+            stats.bytes += bytes;
+            LOG(INFO) << "[MF_TRACE] pid=" << getpid()
+                      << " stage=memfabric_copy tent_batch_id="
+                      << mf_batch->progress_batch_id
+                      << " native_batch_id=" << batch_id
+                      << " peer_id=" << request_list[indices.front()].target_id
+                      << " protocol=" << config_.data_op_type_str
+                      << " write=" << is_write << " requests=" << indices.size()
+                      << " native_slices=" << batch_size << " bytes=" << bytes
+                      << " api_us=" << api_us << " rc=" << ret;
+        }
         if (ret != 0) {
             LOG(ERROR) << "smem_trans_batch_copy failed, ret=" << ret
                        << ", dest_url=" << dest_url
@@ -506,6 +569,11 @@ Status MemFabricTransport::submitTransferTasks(
         inflight_.fetch_add(1, std::memory_order_acq_rel);
         mf_batch->pending_batch_count++;
     }
+    if (tracing) {
+        mf_batch->trace.copy_api_us += copy_api_us;
+        mf_batch->trace.prepare_us +=
+            TransferTrace::ElapsedUs(prepare_start) - copy_api_us;
+    }
 
     return Status::OK();
 }
@@ -526,6 +594,8 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
         return Status::InvalidArgument("invalid task" LOC_MARK);
     }
 
+    const bool tracing = TransferTrace::Enabled();
+    if (tracing) ++mf_batch->trace.status_calls;
     auto& task = mf_batch->task_list[task_id];
     if (task.status_word != TransferStatusEnum::PENDING) {
         status = TransferStatus{task.status_word, task.transferred_bytes};
@@ -544,8 +614,15 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
 
     CHECK_STATUS(bindDevice());
     int32_t batch_result = 0;
+    const auto query_start = TransferTrace::Now();
     auto query_ret = MemFabricUnderApi::SmemTransBatchStatusQuery(
         handle_, task.batch_id, &batch_result, 0);
+    if (tracing) {
+        ++mf_batch->trace.query_calls;
+        mf_batch->trace.query_api_us += TransferTrace::ElapsedUs(query_start);
+        mf_batch->trace.query_errors +=
+            query_ret != SM_OK && query_ret != SM_NEED_RETRY;
+    }
     VLOG(1) << "batch_status_query: batch_id=" << task.batch_id
             << ", query_ret=" << query_ret << ", batch_result=" << batch_result;
 
@@ -555,8 +632,11 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
     }
 
     TransferStatusEnum batch_status = mapBatchStatus(query_ret, batch_result);
+    if (tracing && batch_status == TransferStatusEnum::PENDING)
+        ++mf_batch->trace.pending_queries;
     if (batch_status != TransferStatusEnum::PENDING &&
         batch_status != TransferStatusEnum::COMPLETED) {
+        if (tracing) ++mf_batch->trace.failed_native_batches;
         LOG(WARNING) << "smem_trans_batch_status_query: query_ret=" << query_ret
                      << ", batch_result=" << batch_result
                      << ", batch_id=" << task.batch_id
@@ -565,6 +645,9 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
 
     if (batch_status != TransferStatusEnum::PENDING) {
         if (mf_batch->pending_batch_count > 0) mf_batch->pending_batch_count--;
+        if (tracing && mf_batch->pending_batch_count == 0)
+            mf_batch->trace.observed_completion_us =
+                TransferTrace::ElapsedUs(mf_batch->trace.first_submit);
         if (inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             inflight_cv_.notify_all();
         }

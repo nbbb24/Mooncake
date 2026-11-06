@@ -1008,6 +1008,45 @@ TEST_F(MemFabricTransportTest, SubmitAndGetStatusPending) {
     EXPECT_EQ(mf_batch->pending_batch_count, 1u);
 }
 
+TEST_F(MemFabricTransportTest, TraceCountsNativeGroupsSplitsAndPendingQueries) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    std::vector<Request> requests = {
+        MakeRead(reinterpret_cast<void*>(0x3ffff0), 0x5ffff0, 32),
+        MakeRead(reinterpret_cast<void*>(0x800000), 0xa00000, 64),
+        MakeWrite(reinterpret_cast<void*>(0xc00000), 0xe00000, 64)};
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, requests).ok());
+    ASSERT_EQ(state_->batch_copy_calls, 2);
+    auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch_);
+    ASSERT_NE(mf_batch, nullptr);
+    state_->query_ret = SM_NEED_RETRY;
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    state_->query_ret = SM_OK;
+    for (int task = 0; task < 3; ++task) {
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, task, status).ok());
+        ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    }
+    ASSERT_EQ(state_->status_query_calls, 4);
+    const auto& stats = mf_batch->trace;
+    if (TransferTrace::Enabled()) {
+        EXPECT_EQ(stats.submit_calls, 1u);
+        EXPECT_EQ(stats.requests, 3u);
+        EXPECT_EQ(stats.native_slices, 4u);
+        EXPECT_EQ(stats.bytes, 160u);
+        EXPECT_EQ(stats.copy_calls, state_->batch_copy_calls);
+        EXPECT_EQ(stats.status_calls, 5u);
+        EXPECT_EQ(stats.query_calls, state_->status_query_calls);
+        EXPECT_EQ(stats.pending_queries, 2u);
+        EXPECT_EQ(stats.query_errors, 0u);
+        EXPECT_GE(stats.observed_completion_us, 0);
+    } else {
+        EXPECT_EQ(stats.copy_calls, 0u);
+        EXPECT_EQ(stats.query_calls, 0u);
+    }
+}
+
 TEST_F(MemFabricTransportTest, InvalidDestinationLeavesEmptyBatchUnchanged) {
     ASSERT_TRUE(Install().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());

@@ -35,6 +35,7 @@
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "batch_read_fanout.h"
+#include "transfer_trace.h"
 #include "common.h"
 #include "config.h"
 #include "config/distributed_storage_config.h"
@@ -8518,6 +8519,8 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
+    TransferTrace trace("store_get", true);
+    trace.Add("keys", keys.size());
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -8541,8 +8544,12 @@ RealClient::batch_get_into_multi_buffers_internal(
     if (num_keys == 0) {
         return results;
     }
+    trace.Add("protocol", client_->GetProtocol());
+    trace.Add("group_by_target", group_by_target);
+    trace.Mark("validate");
     // Query metadata for all keys
     const auto query_results = client_->BatchQuery(keys);
+    trace.Mark("master_query");
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
@@ -8676,6 +8683,9 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
+    trace.Add("memory_nof_keys", valid_operations.size());
+    trace.Add("disk_keys", valid_local_disk_ops.size());
+    trace.Mark("select_and_slices");
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
         return results;
@@ -8699,8 +8709,12 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
+        trace.Add("unique_memory_nof_keys", batch_keys.size());
+        trace.Add("duplicate_memory_nof_keys", dedup.duplicates.size());
+        trace.Mark("dedup_and_plan");
         auto batch_get_results = client_->BatchGet(
             batch_keys, batch_query_results, batch_slices, group_by_target);
+        trace.Mark("batch_get");
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
@@ -8729,6 +8743,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                 }});
         }
         FanOutDuplicates(dup_jobs, results);
+        trace.Mark("fanout");
     }
 
     // ---- LOCAL_DISK / file-backed replica read paths ----
@@ -8957,6 +8972,20 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    trace.Mark("disk_and_finalize");
+    if (trace.enabled()) {
+        uint64_t success_keys = 0;
+        uint64_t success_bytes = 0;
+        for (const auto &result : results) {
+            if (result) {
+                ++success_keys;
+                success_bytes += result.value();
+            }
+        }
+        trace.Add("success_keys", success_keys);
+        trace.Add("success_bytes", success_bytes);
+        trace.Add("failed_keys", results.size() - success_keys);
+    }
     return results;
 }
 

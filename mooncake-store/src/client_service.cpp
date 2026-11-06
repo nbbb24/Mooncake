@@ -1730,6 +1730,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool group_by_target) {
+    TransferTrace trace("client_batch_get");
+    trace.Add("keys", object_keys.size());
+    trace.Add("group_by_target", group_by_target);
+    int64_t trace_wait_us = 0;
+    int64_t trace_checksum_us = 0;
+    uint64_t trace_per_key_submits = 0;
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1833,6 +1839,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            if (trace.enabled()) ++trace_per_key_submits;
             future = transfer_submitter_->submit(
                 replica, slices_it->second, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size,
@@ -1852,6 +1859,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             group.cache_used.push_back(cache_used);
             continue;
         } else {
+            if (trace.enabled()) ++trace_per_key_submits;
             future = transfer_submitter_->submit(
                 replica, slices_it->second, TransferRequest::READ, nullptr, 0,
                 TransferIntent::kForegroundGet);
@@ -1898,6 +1906,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << " keys from " << endpoint;
     }
 
+    trace.Add("per_key_submit_calls", trace_per_key_submits);
+    trace.Add("group_submit_calls", target_groups.size());
+    trace.Add("pending_key_futures", pending_transfers.size());
+    trace.Add("hot_cache_hits", total_cache_hits);
+    trace.Mark("prepare_and_submit");
     if (!dfs_read_requests.empty()) {
         auto* dfs_metric = GetDfsMetricPtr();
         const auto dfs_read_start = std::chrono::steady_clock::now();
@@ -1971,10 +1984,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << ", latency_us=" << dfs_read_latency_us;
     }
 
+    trace.Mark("dfs_read");
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        const auto wait_start = TransferTrace::Now();
         ErrorCode result = future.get();
+        trace_wait_us += TransferTrace::ElapsedUs(wait_start);
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
@@ -1992,9 +2008,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            const auto checksum_start = TransferTrace::Now();
             auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
+            trace_checksum_us += TransferTrace::ElapsedUs(checksum_start);
             if (!checksum_result) {
                 results[index] = tl::unexpected(checksum_result.error());
                 continue;
@@ -2013,6 +2031,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
+    trace.Add("future_wait_us", trace_wait_us);
+    trace.Add("checksum_us", trace_checksum_us);
+    trace.Mark("wait_and_postprocess");
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
     std::chrono::steady_clock::time_point now =

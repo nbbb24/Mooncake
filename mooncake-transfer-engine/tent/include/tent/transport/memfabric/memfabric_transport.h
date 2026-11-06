@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "memfabric_types.h"
+#include "transfer_trace.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/memfabric/memfabric_under_api.h"
@@ -39,6 +40,26 @@ struct MemFabricTask {
 };
 
 struct MemFabricSubBatch : public Transport::SubBatch {
+    struct TraceStats {
+        uint64_t submit_calls = 0;
+        uint64_t requests = 0;
+        uint64_t native_slices = 0;
+        uint64_t bytes = 0;
+        uint64_t copy_calls = 0;
+        uint64_t copy_errors = 0;
+        uint64_t status_calls = 0;
+        uint64_t query_calls = 0;
+        uint64_t pending_queries = 0;
+        uint64_t query_errors = 0;
+        uint64_t failed_native_batches = 0;
+        int64_t submit_lock_wait_us = 0;
+        int64_t resolve_dest_us = 0;
+        int64_t prepare_us = 0;
+        int64_t copy_api_us = 0;
+        int64_t query_api_us = 0;
+        TransferTrace::Clock::time_point first_submit{};
+        int64_t observed_completion_us = -1;
+    } trace;
     std::vector<MemFabricTask> task_list;
     std::unordered_map<uint64_t, TransferStatusEnum> batch_status_cache;
     size_t pending_batch_count = 0;

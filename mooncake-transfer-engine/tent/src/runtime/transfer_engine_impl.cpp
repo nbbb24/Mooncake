@@ -43,6 +43,7 @@
 #include "tent/metrics/tent_metrics.h"
 #include "tent/metrics/config_loader.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
+#include "transfer_trace.h"
 #ifdef USE_XPU
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
@@ -2980,6 +2981,9 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind,
     bool require_post_submit_cancellation) {
+    TransferTrace trace("tent_submit");
+    trace.Add("tent_batch_id", batch_id);
+    trace.Add("input_requests", request_list.size());
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
@@ -2988,12 +2992,16 @@ Status TransferEngineImpl::submitTransfer(
         // respect to polling, cancellation and other submits on this batch.
         // Queue mode uses the global progress lock; direct mode uses its shard.
         std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+        trace.Mark("retain_and_lock");
         const size_t start_task_id = batch_ref.get()->task_list.size();
         PreparedSubmit prepared;
         CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
                                    require_post_submit_cancellation));
+        trace.Add("physical_requests", prepared.owners.size());
+        trace.Mark("prepare_merge_route");
 
         if (shouldQueueSubmit(prepared, owner_kind)) {
+            trace.Add("queued", true);
             CHECK_STATUS(
                 enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
             auto dispatch_status = refillDispatchWindow();
@@ -3004,9 +3012,11 @@ Status TransferEngineImpl::submitTransfer(
             }
             notifyRuntimeQueueReady();
         } else {
+            trace.Add("queued", false);
             CHECK_STATUS(
                 commitPreparedSubmit(batch_ref.get(), prepared, owner_kind));
         }
+        trace.Mark("dispatch_or_enqueue");
 
         if (notifi) {
             addSubmitHook(batch_ref.get(), start_task_id, request_list,

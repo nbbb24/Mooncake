@@ -824,6 +824,11 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 TransferEngineOperationState::~TransferEngineOperationState() {
+    trace_.Add("tent_batch_id", batch_id_);
+    trace_.Add("tasks", batch_size_);
+    trace_.Add("poll_rounds", trace_poll_rounds_);
+    trace_.Add("tent_status_calls", trace_status_calls_);
+    trace_.Add("status_call_us", trace_status_us_);
 #ifdef USE_TENT
     if (tent_engine_)
         tent_engine_->freeBatch(batch_id_);
@@ -843,6 +848,7 @@ bool TransferEngineOperationState::is_completed() {
 }
 
 void TransferEngineOperationState::check_task_status() {
+    if (trace_.enabled()) ++trace_poll_rounds_;
     // Check all transfers in the batch.
     // Wait for ALL tasks to reach a terminal state before setting the result,
     // even if some have already failed. This prevents the caller from seeing
@@ -857,8 +863,13 @@ void TransferEngineOperationState::check_task_status() {
 #ifdef USE_TENT
         if (tent_engine_) {
             tent::TransferStatus tent_status;
+            const auto status_start = TransferTrace::Now();
             auto tent_s =
                 tent_engine_->getTransferStatus(batch_id_, i, tent_status);
+            if (trace_.enabled()) {
+                ++trace_status_calls_;
+                trace_status_us_ += TransferTrace::ElapsedUs(status_start);
+            }
             if (!tent_s.ok()) {
                 LOG(ERROR) << "Failed to get transfer status for batch "
                            << batch_id_ << " task " << i << " with error "
@@ -945,6 +956,8 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
+    trace_.Add("result", static_cast<int>(error_code));
+    trace_.Mark("until_result");
     result_.emplace(error_code);
 }
 
@@ -1165,6 +1178,9 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code, TransferIntent intent) {
+    TransferTrace trace("store_submit_batch");
+    trace.Add("replicas", replicas.size());
+    int64_t trace_open_segment_us = 0;
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice lists";
         return std::nullopt;
@@ -1207,8 +1223,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 #ifdef USE_TENT
         if (tent_engine_) {
             tent::SegmentID seg_id;
+            const auto open_start = TransferTrace::Now();
             auto status =
                 tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+            trace_open_segment_us += TransferTrace::ElapsedUs(open_start);
             if (!status.ok()) {
                 LOG(ERROR) << "Failed to open segment "
                            << handle.transport_endpoint_;
@@ -1236,9 +1254,15 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
+    trace.Add("local_memcpy", use_local_memcpy);
+    trace.Add("requests", requests.size());
+    trace.Add("open_segment_us", trace_open_segment_us);
+    trace.Mark("prepare");
     auto future = use_local_memcpy
                       ? submitMemcpyOperations(std::move(memcpy_operations))
                       : submitTransfer(requests, intent);
+    trace.Add("submit_ok", future.has_value());
+    trace.Mark("submit");
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1749,6 +1773,13 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests, TransferIntent intent) {
+    TransferTrace trace("store_te_submit");
+    trace.Add("requests", requests.size());
+    if (trace.enabled()) {
+        uint64_t bytes = 0;
+        for (const auto& request : requests) bytes += request.length;
+        trace.Add("bytes", bytes);
+    }
     const size_t batch_size = requests.size();
 
     BatchID batch_id = INVALID_BATCH_ID;
@@ -1757,6 +1788,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 #ifdef USE_TENT
     if (tent_engine_) {
         batch_id = tent_engine_->allocateBatch(batch_size);
+        trace.Add("tent_batch_id", batch_id);
+        trace.Mark("allocate");
         if (batch_id == 0) {
             LOG(ERROR) << "Failed to allocate batch ID";
             return std::nullopt;
@@ -1789,7 +1822,10 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tr.intent_type = *tent_intent;
             tent_reqs.push_back(tr);
         }
+        trace.Mark("convert");
         auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
+        trace.Add("submit_ok", tent_status.ok());
+        trace.Mark("tent_submit");
         if (!tent_status.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error: "
                        << tent_status.ToString();
@@ -1823,6 +1859,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset,
     TransferIntent intent) {
+    TransferTrace trace("store_submit_slices");
+    trace.Add("slices", slices.size());
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -1851,6 +1889,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         }
     }
 
+    trace.Mark("open_segment");
     // Create transfer requests
     std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
@@ -1871,6 +1910,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
+    trace.Mark("prepare_requests");
     return submitTransfer(requests, intent);
 }
 

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "transfer_engine.h"
+#include "transfer_trace.h"
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
@@ -280,6 +281,10 @@ class TransferEngineOperationState : public OperationState {
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    TransferTrace trace_{"transfer_wait"};
+    uint64_t trace_poll_rounds_ = 0;
+    uint64_t trace_status_calls_ = 0;
+    int64_t trace_status_us_ = 0;
 };
 
 /**
